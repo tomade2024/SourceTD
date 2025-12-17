@@ -1,1 +1,5 @@
-streamlit
+streamlit==1.39.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+lxml==5.3.0
+bcrypt==4.2.0
