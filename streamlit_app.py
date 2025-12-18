@@ -76,8 +76,8 @@ def debug_db_connection():
 def db_conn():
     """
     Stellt die Verbindung zu Supabase Postgres her.
-    Supabase erwartet SSL, daher ergänzen wir sslmode=require,
-    falls es nicht bereits in der URL steht.
+    Supabase verlangt SSL, daher ergänzen wir sslmode=require,
+    falls es nicht schon in der URL steht.
     """
     dsn = DATABASE_URL
     if "sslmode=" not in dsn:
