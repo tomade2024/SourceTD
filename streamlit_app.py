@@ -2,7 +2,6 @@ import re
 import math
 import time
 import hashlib
-import sqlite3
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 
@@ -10,71 +9,86 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 import bcrypt
+import psycopg2
+from psycopg2 import IntegrityError
+import stripe
 
 
 # ============================
 # CONFIG
 # ============================
 APP_NAME = "SourceTD (MVP)"
-DB_PATH = "sourcetd.db"
 
-# Limits (pro Nutzer pro Tag)
-FREE_DAILY_LIMIT = 20
-PRO_DAILY_LIMIT = 10_000  # praktisch unbegrenzt für MVP
+# Supabase / Postgres
+DATABASE_URL = st.secrets["DATABASE_URL"]
+
+# Stripe
+stripe.api_key = st.secrets["STRIPE_SECRET_KEY"]
+BASIC_PRICE_ID = st.secrets["STRIPE_BASIC_PRICE_ID"]
+PRO_PRICE_ID = st.secrets["STRIPE_PRO_PRICE_ID"]
+APP_BASE_URL = st.secrets["APP_BASE_URL"]
+
+# Tarif-Konstanten
+TIER_FREE = "free"
+TIER_BASIC = "basic"    # neuer bezahlter Tarif
+TIER_PRO = "pro"
+
+# Limits pro Tag je Tarif
+DAILY_LIMITS: Dict[str, int] = {
+    TIER_FREE: 20,        # z. B. 20 Analysen/Tag
+    TIER_BASIC: 100,      # z. B. 100 Analysen/Tag
+    TIER_PRO: 10_000,     # praktisch unbegrenzt
+}
 
 # URL Cache (Session)
 CACHE_TTL_SECONDS = 60 * 30
-
 DEFAULT_TIMEOUT = 12
 
 
 # ============================
-# DATABASE
+# HELFER
 # ============================
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    return conn
-
-
-def init_db():
-    conn = db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            pw_hash BLOB NOT NULL,
-            tier TEXT NOT NULL DEFAULT 'free',
-            created_at INTEGER NOT NULL
-        );
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS usage_daily (
-            user_id INTEGER NOT NULL,
-            day_key TEXT NOT NULL,
-            count INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (user_id, day_key),
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
-    """)
-    conn.commit()
-    conn.close()
+def get_daily_limit(tier: str) -> int:
+    return DAILY_LIMITS.get(tier, DAILY_LIMITS[TIER_FREE])
 
 
 def day_key_local() -> str:
-    # Streamlit Cloud: Server-Zeitzone kann abweichen; für MVP ist YYYY-MM-DD okay.
-    # Wenn du "Europe/Berlin" exakt willst: später pytz/zoneinfo nutzen.
     return time.strftime("%Y-%m-%d")
 
 
+def stable_key(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+# ============================
+# DATABASE (Supabase Postgres)
+# ============================
+def db_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+
 def get_user_by_email(email: str) -> Optional[dict]:
-    conn = db()
-    cur = conn.execute("SELECT id, email, pw_hash, tier FROM users WHERE email = ?", (email.lower().strip(),))
-    row = cur.fetchone()
-    conn.close()
+    email = email.lower().strip()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, email, pw_hash, tier, stripe_customer_id
+                FROM public.users
+                WHERE email = %s
+                """,
+                (email,),
+            )
+            row = cur.fetchone()
     if not row:
         return None
-    return {"id": row[0], "email": row[1], "pw_hash": row[2], "tier": row[3]}
+    return {
+        "id": row[0],
+        "email": row[1],
+        "pw_hash": row[2],  # bytea -> memoryview/bytes
+        "tier": row[3],
+        "stripe_customer_id": row[4],
+    }
 
 
 def create_user(email: str, password: str) -> Tuple[bool, str]:
@@ -85,57 +99,86 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
         return False, "Passwort muss mindestens 8 Zeichen lang sein."
 
     pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    conn = db()
+
     try:
-        conn.execute(
-            "INSERT INTO users (email, pw_hash, tier, created_at) VALUES (?, ?, 'free', ?)",
-            (email, pw_hash, int(time.time()))
-        )
-        conn.commit()
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.users (email, pw_hash, tier)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (email, psycopg2.Binary(pw_hash), TIER_FREE),
+                )
         return True, "Account erstellt. Du kannst dich jetzt anmelden."
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False, "Diese E-Mail ist bereits registriert."
-    finally:
-        conn.close()
+    except Exception as e:
+        return False, f"Fehler beim Anlegen des Accounts: {e}"
 
 
 def verify_login(email: str, password: str) -> Tuple[bool, Optional[dict], str]:
     user = get_user_by_email(email)
     if not user:
         return False, None, "Login fehlgeschlagen (E-Mail oder Passwort falsch)."
-    if not bcrypt.checkpw(password.encode("utf-8"), user["pw_hash"]):
+
+    stored = user["pw_hash"]
+    if isinstance(stored, memoryview):
+        stored_bytes = stored.tobytes()
+    elif isinstance(stored, (bytes, bytearray)):
+        stored_bytes = bytes(stored)
+    elif isinstance(stored, str):
+        stored_bytes = stored.encode("utf-8")
+    else:
+        return False, None, "Login nicht möglich: unerwartetes Passwortformat in der Datenbank."
+
+    try:
+        ok = bcrypt.checkpw(password.encode("utf-8"), stored_bytes)
+    except Exception as e:
+        return False, None, f"Fehler bei der Passwortprüfung: {e}"
+
+    if not ok:
         return False, None, "Login fehlgeschlagen (E-Mail oder Passwort falsch)."
+
     return True, user, ""
 
 
 def get_usage_count(user_id: int, day: str) -> int:
-    conn = db()
-    cur = conn.execute("SELECT count FROM usage_daily WHERE user_id = ? AND day_key = ?", (user_id, day))
-    row = cur.fetchone()
-    conn.close()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count FROM public.usage_daily WHERE user_id = %s AND day_key = %s",
+                (user_id, day),
+            )
+            row = cur.fetchone()
     return int(row[0]) if row else 0
 
 
 def increment_usage(user_id: int, day: str) -> None:
-    conn = db()
-    conn.execute("""
-        INSERT INTO usage_daily (user_id, day_key, count)
-        VALUES (?, ?, 1)
-        ON CONFLICT(user_id, day_key) DO UPDATE SET count = count + 1;
-    """, (user_id, day))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.usage_daily (user_id, day_key, count)
+                VALUES (%s, %s, 1)
+                ON CONFLICT (user_id, day_key)
+                DO UPDATE SET count = public.usage_daily.count + 1;
+                """,
+                (user_id, day),
+            )
 
 
 def set_tier(user_id: int, tier: str) -> None:
-    conn = db()
-    conn.execute("UPDATE users SET tier = ? WHERE id = ?", (tier, user_id))
-    conn.commit()
-    conn.close()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE public.users SET tier = %s WHERE id = %s",
+                (tier, user_id),
+            )
 
 
 # ============================
-# TEXT EXTRACTION
+# TEXT-EXTRAKTION
 # ============================
 def fetch_and_extract_text(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[str, Dict[str, str]]:
     headers = {"User-Agent": "SourceTD-MVP/0.1"}
@@ -155,10 +198,6 @@ def fetch_and_extract_text(url: str, timeout: int = DEFAULT_TIMEOUT) -> Tuple[st
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
     return text, {"title": title, "status_code": str(r.status_code)}
-
-
-def stable_key(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
 # ============================
@@ -321,16 +360,31 @@ def cache_set(key: str, value: dict) -> None:
 
 
 # ============================
-# Billing MVP: Pro redeem codes
+# Stripe Checkout & Billing Portal
 # ============================
-def get_redeem_codes() -> set:
-    # In Streamlit Cloud unter Settings -> Secrets:
-    # REDEEM_CODES = ["CODE1", "CODE2", ...]
-    try:
-        codes = st.secrets.get("REDEEM_CODES", [])
-        return set([str(c).strip() for c in codes])
-    except Exception:
-        return set()
+def create_checkout_session(price_id: str, user_email: str, user_id: int, success_flag: str) -> str:
+    """
+    Erstellt eine Stripe-Checkout-Session für ein Subscription-Produkt.
+    success_flag ist z. B. 'success_basic' oder 'success_pro'
+    """
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        line_items=[{"price": price_id, "quantity": 1}],
+        success_url=f"{APP_BASE_URL}?checkout={success_flag}",
+        cancel_url=f"{APP_BASE_URL}?checkout=cancel",
+        customer_email=user_email,
+        client_reference_id=str(user_id),
+        allow_promotion_codes=True,
+    )
+    return session.url
+
+
+def create_billing_portal(user_customer_id: str) -> str:
+    portal = stripe.billing_portal.Session.create(
+        customer=user_customer_id,
+        return_url=APP_BASE_URL,
+    )
+    return portal.url
 
 
 # ============================
@@ -348,7 +402,12 @@ def login_box():
     if st.button("Anmelden", type="primary"):
         ok, user, msg = verify_login(email, pw)
         if ok:
-            st.session_state["user"] = {"id": user["id"], "email": user["email"], "tier": user["tier"]}
+            st.session_state["user"] = {
+                "id": user["id"],
+                "email": user["email"],
+                "tier": user["tier"],
+                "stripe_customer_id": user.get("stripe_customer_id"),
+            }
             st.success("Erfolgreich angemeldet.")
             st.rerun()
         else:
@@ -375,40 +434,30 @@ def logout_button():
 
 
 def tier_badge(tier: str) -> str:
-    return "Pro" if tier == "pro" else "Free"
+    if tier == TIER_PRO:
+        return "Pro"
+    if tier == TIER_BASIC:
+        return "Basic"
+    return "Free"
 
 
 def can_analyze(user: dict) -> Tuple[bool, str, int, int]:
     day = day_key_local()
     used = get_usage_count(user["id"], day)
-    limit = PRO_DAILY_LIMIT if user["tier"] == "pro" else FREE_DAILY_LIMIT
+    limit = get_daily_limit(user["tier"])
     if used >= limit:
-        return False, f"Tageslimit erreicht ({used}/{limit}). Upgrade auf Pro, um mehr Analysen zu erhalten.", used, limit
+        return (
+            False,
+            f"Tageslimit erreicht ({used}/{limit}). Ein Upgrade auf einen höheren Tarif ermöglicht mehr Analysen.",
+            used,
+            limit,
+        )
     return True, "", used, limit
-
-
-def redeem_pro_ui(user: dict):
-    st.markdown("### Pro aktivieren")
-    st.caption("MVP: Pro wird per Redeem-Code freigeschaltet (z. B. für Closed Beta).")
-    code = st.text_input("Redeem-Code", key="redeem_code")
-    if st.button("Code einlösen"):
-        codes = get_redeem_codes()
-        if not codes:
-            st.error("Keine Redeem-Codes konfiguriert (Secrets).")
-            return
-        if code.strip() in codes:
-            set_tier(user["id"], "pro")
-            st.session_state["user"]["tier"] = "pro"
-            st.success("Pro wurde aktiviert.")
-            st.rerun()
-        else:
-            st.error("Ungültiger Code.")
 
 
 # ============================
 # UI
 # ============================
-init_db()
 st.set_page_config(page_title=APP_NAME, layout="centered")
 
 st.title("SourceTD")
@@ -419,27 +468,93 @@ require_login()
 
 tab_analyze, tab_method, tab_account = st.tabs(["Analyse", "Methodik", "Account"])
 
+# --- Account-Tab ---
 with tab_account:
     user = st.session_state.get("user")
+
+    # Query-Parameter (Checkout Rückkehr)
+    params = st.experimental_get_query_params()
+    checkout_status = params.get("checkout", [None])[0]
+
+    if checkout_status in ("success_basic", "success_pro") and user:
+        st.success("Zahlung bei Stripe erfolgreich. Dein Tarif wird aktualisiert.")
+        fresh = get_user_by_email(user["email"])
+        if fresh:
+            st.session_state["user"]["tier"] = fresh["tier"]
+            st.session_state["user"]["stripe_customer_id"] = fresh.get("stripe_customer_id")
+            user = st.session_state["user"]
+    elif checkout_status == "cancel":
+        st.info("Checkout bei Stripe wurde abgebrochen.")
+
     if not user:
         col1, col2 = st.columns(2)
         with col1:
             login_box()
         with col2:
             register_box()
-        st.info("Für die Analyse ist ein Login erforderlich (MVP), damit Free/Pro-Limits fair umgesetzt werden können.")
+        st.info("Für die Analyse ist ein Login erforderlich (MVP), damit Free/Basic/Pro-Limits fair umgesetzt werden können.")
     else:
         st.markdown(f"**Angemeldet:** {user['email']}")
         st.markdown(f"**Tarif:** {tier_badge(user['tier'])}")
         day = day_key_local()
         used = get_usage_count(user["id"], day)
-        limit = PRO_DAILY_LIMIT if user["tier"] == "pro" else FREE_DAILY_LIMIT
+        limit = get_daily_limit(user["tier"])
         st.markdown(f"**Nutzung heute:** {used} / {limit}")
         logout_button()
-        if user["tier"] != "pro":
-            st.divider()
-            redeem_pro_ui(user)
 
+        st.divider()
+        st.markdown("### Abo / Tarife")
+
+        if user["tier"] == TIER_FREE:
+            st.write("Du nutzt aktuell den Free-Tarif. Du kannst auf Basic oder Pro upgraden, um höhere Limits zu erhalten.")
+            col_basic, col_pro = st.columns(2)
+            with col_basic:
+                if st.button("Basic abonnieren", type="secondary"):
+                    checkout_url = create_checkout_session(
+                        price_id=BASIC_PRICE_ID,
+                        user_email=user["email"],
+                        user_id=user["id"],
+                        success_flag="success_basic",
+                    )
+                    st.link_button("Weiter zu Stripe Checkout (Basic)", checkout_url)
+            with col_pro:
+                if st.button("Pro abonnieren", type="primary"):
+                    checkout_url = create_checkout_session(
+                        price_id=PRO_PRICE_ID,
+                        user_email=user["email"],
+                        user_id=user["id"],
+                        success_flag="success_pro",
+                    )
+                    st.link_button("Weiter zu Stripe Checkout (Pro)", checkout_url)
+        elif user["tier"] == TIER_BASIC:
+            st.success("Du bist aktuell Basic-Nutzer.")
+            col_upgrade, col_portal = st.columns(2)
+            with col_upgrade:
+                if st.button("Auf Pro upgraden", type="primary"):
+                    checkout_url = create_checkout_session(
+                        price_id=PRO_PRICE_ID,
+                        user_email=user["email"],
+                        user_id=user["id"],
+                        success_flag="success_pro",
+                    )
+                    st.link_button("Weiter zu Stripe Checkout (Pro)", checkout_url)
+            with col_portal:
+                if user.get("stripe_customer_id"):
+                    if st.button("Abo verwalten (Billing Portal)"):
+                        portal_url = create_billing_portal(user["stripe_customer_id"])
+                        st.link_button("Zum Stripe Billing Portal", portal_url)
+                else:
+                    st.info("Stripe-Konto ist noch nicht vollständig verknüpft (stripe_customer_id fehlt).")
+        else:  # Pro
+            st.success("Du bist aktuell Pro-Nutzer.")
+            if user.get("stripe_customer_id"):
+                if st.button("Abo verwalten (Billing Portal)"):
+                    portal_url = create_billing_portal(user["stripe_customer_id"])
+                    st.link_button("Zum Stripe Billing Portal", portal_url)
+            else:
+                st.info("Stripe-Konto ist noch nicht vollständig verknüpft (stripe_customer_id fehlt).")
+
+# --- Methodik-Tab ---
 with tab_method:
     st.markdown("## Methodik (MVP)")
     st.write(
@@ -461,6 +576,7 @@ with tab_method:
         "- Paywalls/Layouts können Extraktion erschweren.\n"
     )
 
+# --- Analyse-Tab ---
 with tab_analyze:
     user = st.session_state.get("user")
     if not user:
@@ -474,7 +590,6 @@ with tab_analyze:
 
     article_text: Optional[str] = None
     meta: Dict[str, str] = {}
-
     run_clicked = False
 
     if mode == "URL analysieren":
@@ -484,9 +599,7 @@ with tab_analyze:
             if not ok:
                 st.error(msg)
             else:
-                # Erst Nutzung buchen, dann arbeiten (verhindert Spam-Retry)
                 increment_usage(user["id"], day_key_local())
-
                 key = "url:" + stable_key(url.strip())
                 cached = cache_get(key)
                 if cached:
@@ -499,7 +612,6 @@ with tab_analyze:
                         cache_set(key, {"text": article_text, "meta": meta})
                     except Exception as e:
                         st.error(f"Fehler beim Laden/Extrahieren: {e}")
-
     else:
         article_text = st.text_area("Artikeltext", height=220, placeholder="Text hier einfügen…")
         run_clicked = st.button("Analysieren", type="primary", disabled=not article_text)
