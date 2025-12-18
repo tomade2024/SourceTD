@@ -534,4 +534,3 @@ with tab_analyze:
         module_block("Sprache & Tonalität", "language")
         module_block("Perspektivenvielfalt", "perspectives")
         module_block("Kontext & Vollständigkeit", "context")
-
