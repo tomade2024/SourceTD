@@ -59,6 +59,16 @@ def day_key_local() -> str:
 def stable_key(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
+def debug_db_connection():
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT current_database(), current_user;")
+                row = cur.fetchone()
+        st.success(f"DB-Verbindung OK: DB={row[0]}, User={row[1]}")
+    except Exception as e:
+        # Hier siehst du den echten psycopg2-Fehler
+        st.error(f\"DB-Verbindungsfehler: {e!r}\")
 
 # ============================
 # DATABASE (Supabase Postgres)
