@@ -64,7 +64,16 @@ def stable_key(s: str) -> str:
 # DATABASE (Supabase Postgres)
 # ============================
 def db_conn():
-    return psycopg2.connect(DATABASE_URL)
+    """
+    Stellt die Verbindung zu Supabase Postgres her.
+    Supabase erwartet SSL, daher ergänzen wir sslmode=require,
+    falls es nicht bereits in der URL steht.
+    """
+    dsn = DATABASE_URL
+    if "sslmode=" not in dsn:
+        sep = "&" if "?" in dsn else "?"
+        dsn = dsn + f"{sep}sslmode=require"
+    return psycopg2.connect(dsn)
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
