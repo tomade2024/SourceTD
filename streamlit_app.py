@@ -35,7 +35,7 @@ TIER_PRO = "pro"
 
 # Limits pro Tag je Tarif
 DAILY_LIMITS: Dict[str, int] = {
-    TIER_FREE: 20,        # z. B. 20 Analysen/Tag
+    TIER_FREE: 5,        # z. B. 20 Analysen/Tag
     TIER_BASIC: 100,      # z. B. 100 Analysen/Tag
     TIER_PRO: 10_000,     # praktisch unbegrenzt
 }
@@ -59,6 +59,7 @@ def day_key_local() -> str:
 def stable_key(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
+
 def debug_db_connection():
     try:
         with db_conn() as conn:
@@ -67,8 +68,7 @@ def debug_db_connection():
                 row = cur.fetchone()
         st.success(f"DB-Verbindung OK: DB={row[0]}, User={row[1]}")
     except Exception as e:
-        # Hier siehst du den echten psycopg2-Fehler
-        st.error(f\"DB-Verbindungsfehler: {e!r}\")
+        st.error(f"DB-Verbindungsfehler: {e!r}")
 
 # ============================
 # DATABASE (Supabase Postgres)
