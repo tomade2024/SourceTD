@@ -25,8 +25,8 @@ TIER_PRO = "pro"
 
 # Limits pro Tag je Tarif
 DAILY_LIMITS: Dict[str, int] = {
-    TIER_FREE: 20,        # z. B. 20 Analysen/Tag
-    TIER_BASIC: 100,      # z. B. 100 Analysen/Tag
+    TIER_FREE: 3,        # z. B. 20 Analysen/Tag
+    TIER_BASIC: 20,      # z. B. 100 Analysen/Tag
     TIER_PRO: 10_000,     # quasi unbegrenzt im MVP
 }
 
