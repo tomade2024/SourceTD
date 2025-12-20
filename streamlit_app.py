@@ -1094,4 +1094,4 @@ Die Vervielfältigung, Bearbeitung, Verbreitung und jede Art der Verwertung auß
 
 """
     )
-    st.info("Bitte passe Namen, Adresse und Kontaktdaten im Impressum an deine tatsächlichen Angaben an.")
+    st.info("Google. Apple oder Mircosoft Intresse ? Dann schickt mal eine Mail :).")
