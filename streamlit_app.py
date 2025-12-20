@@ -2,6 +2,7 @@ import re
 import math
 import time
 import hashlib
+import sqlite3
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
 
@@ -9,35 +10,24 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 import bcrypt
-import psycopg2
-from psycopg2 import IntegrityError
-import stripe
 
 
 # ============================
 # CONFIG
 # ============================
 APP_NAME = "SourceTD (MVP)"
-
-# Supabase / Postgres
-DATABASE_URL = st.secrets["DATABASE_URL"]
-
-# Stripe
-stripe.api_key = st.secrets["STRIPE_SECRET_KEY"]
-BASIC_PRICE_ID = st.secrets["STRIPE_BASIC_PRICE_ID"]
-PRO_PRICE_ID = st.secrets["STRIPE_PRO_PRICE_ID"]
-APP_BASE_URL = st.secrets["APP_BASE_URL"]
+DB_PATH = "sourcetd.db"
 
 # Tarif-Konstanten
 TIER_FREE = "free"
-TIER_BASIC = "basic"    # neuer bezahlter Tarif
+TIER_BASIC = "basic"   # zweiter bezahlbarer Tarif
 TIER_PRO = "pro"
 
 # Limits pro Tag je Tarif
 DAILY_LIMITS: Dict[str, int] = {
-    TIER_FREE: 5,        # z. B. 20 Analysen/Tag
+    TIER_FREE: 20,        # z. B. 20 Analysen/Tag
     TIER_BASIC: 100,      # z. B. 100 Analysen/Tag
-    TIER_PRO: 10_000,     # praktisch unbegrenzt
+    TIER_PRO: 10_000,     # quasi unbegrenzt im MVP
 }
 
 # URL Cache (Session)
@@ -60,58 +50,53 @@ def stable_key(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def debug_db_connection():
-    try:
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT current_database(), current_user;")
-                row = cur.fetchone()
-        st.success(f"DB-Verbindung OK: DB={row[0]}, User={row[1]}")
-    except Exception as e:
-        st.error(f"DB-Verbindungsfehler: {e!r}")
-
 # ============================
-# DATABASE (Supabase Postgres)
+# DATABASE (SQLite)
 # ============================
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
 
 
-
-def db_conn():
-    """
-    Stellt die Verbindung zu Supabase Postgres her.
-    Supabase verlangt SSL, daher ergänzen wir sslmode=require,
-    falls es nicht schon in der URL steht.
-    """
-    dsn = DATABASE_URL
-    if "sslmode=" not in dsn:
-        sep = "&" if "?" in dsn else "?"
-        dsn = dsn + f"{sep}sslmode=require"
-    return psycopg2.connect(dsn)
-
-
+def init_db():
+    conn = db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            pw_hash BLOB NOT NULL,
+            tier TEXT NOT NULL DEFAULT 'free',
+            created_at INTEGER NOT NULL
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS usage_daily (
+            user_id INTEGER NOT NULL,
+            day_key TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, day_key),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+    """)
+    conn.commit()
+    conn.close()
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
-    email = email.lower().strip()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, email, pw_hash, tier, stripe_customer_id
-                FROM public.users
-                WHERE email = %s
-                """,
-                (email,),
-            )
-            row = cur.fetchone()
+    conn = db()
+    cur = conn.execute(
+        "SELECT id, email, pw_hash, tier FROM users WHERE email = ?",
+        (email.lower().strip(),),
+    )
+    row = cur.fetchone()
+    conn.close()
     if not row:
         return None
     return {
         "id": row[0],
         "email": row[1],
-        "pw_hash": row[2],  # bytea -> memoryview/bytes
+        "pw_hash": row[2],
         "tier": row[3],
-        "stripe_customer_id": row[4],
     }
 
 
@@ -123,22 +108,18 @@ def create_user(email: str, password: str) -> Tuple[bool, str]:
         return False, "Passwort muss mindestens 8 Zeichen lang sein."
 
     pw_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-
+    conn = db()
     try:
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO public.users (email, pw_hash, tier)
-                    VALUES (%s, %s, %s)
-                    """,
-                    (email, psycopg2.Binary(pw_hash), TIER_FREE),
-                )
+        conn.execute(
+            "INSERT INTO users (email, pw_hash, tier, created_at) VALUES (?, ?, ?, ?)",
+            (email, pw_hash, TIER_FREE, int(time.time())),
+        )
+        conn.commit()
         return True, "Account erstellt. Du kannst dich jetzt anmelden."
-    except IntegrityError:
+    except sqlite3.IntegrityError:
         return False, "Diese E-Mail ist bereits registriert."
-    except Exception as e:
-        return False, f"Fehler beim Anlegen des Accounts: {e}"
+    finally:
+        conn.close()
 
 
 def verify_login(email: str, password: str) -> Tuple[bool, Optional[dict], str]:
@@ -147,17 +128,8 @@ def verify_login(email: str, password: str) -> Tuple[bool, Optional[dict], str]:
         return False, None, "Login fehlgeschlagen (E-Mail oder Passwort falsch)."
 
     stored = user["pw_hash"]
-    if isinstance(stored, memoryview):
-        stored_bytes = stored.tobytes()
-    elif isinstance(stored, (bytes, bytearray)):
-        stored_bytes = bytes(stored)
-    elif isinstance(stored, str):
-        stored_bytes = stored.encode("utf-8")
-    else:
-        return False, None, "Login nicht möglich: unerwartetes Passwortformat in der Datenbank."
-
     try:
-        ok = bcrypt.checkpw(password.encode("utf-8"), stored_bytes)
+        ok = bcrypt.checkpw(password.encode("utf-8"), stored)
     except Exception as e:
         return False, None, f"Fehler bei der Passwortprüfung: {e}"
 
@@ -168,37 +140,38 @@ def verify_login(email: str, password: str) -> Tuple[bool, Optional[dict], str]:
 
 
 def get_usage_count(user_id: int, day: str) -> int:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT count FROM public.usage_daily WHERE user_id = %s AND day_key = %s",
-                (user_id, day),
-            )
-            row = cur.fetchone()
+    conn = db()
+    cur = conn.execute(
+        "SELECT count FROM usage_daily WHERE user_id = ? AND day_key = ?",
+        (user_id, day),
+    )
+    row = cur.fetchone()
+    conn.close()
     return int(row[0]) if row else 0
 
 
 def increment_usage(user_id: int, day: str) -> None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO public.usage_daily (user_id, day_key, count)
-                VALUES (%s, %s, 1)
-                ON CONFLICT (user_id, day_key)
-                DO UPDATE SET count = public.usage_daily.count + 1;
-                """,
-                (user_id, day),
-            )
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO usage_daily (user_id, day_key, count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, day_key) DO UPDATE SET count = count + 1;
+        """,
+        (user_id, day),
+    )
+    conn.commit()
+    conn.close()
 
 
 def set_tier(user_id: int, tier: str) -> None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE public.users SET tier = %s WHERE id = %s",
-                (tier, user_id),
-            )
+    conn = db()
+    conn.execute(
+        "UPDATE users SET tier = ? WHERE id = ?",
+        (tier, user_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ============================
@@ -384,31 +357,58 @@ def cache_set(key: str, value: dict) -> None:
 
 
 # ============================
-# Stripe Checkout & Billing Portal
+# Redeem Codes (Basic / Pro)
 # ============================
-def create_checkout_session(price_id: str, user_email: str, user_id: int, success_flag: str) -> str:
-    """
-    Erstellt eine Stripe-Checkout-Session für ein Subscription-Produkt.
-    success_flag ist z. B. 'success_basic' oder 'success_pro'
-    """
-    session = stripe.checkout.Session.create(
-        mode="subscription",
-        line_items=[{"price": price_id, "quantity": 1}],
-        success_url=f"{APP_BASE_URL}?checkout={success_flag}",
-        cancel_url=f"{APP_BASE_URL}?checkout=cancel",
-        customer_email=user_email,
-        client_reference_id=str(user_id),
-        allow_promotion_codes=True,
-    )
-    return session.url
+def get_basic_codes() -> set:
+    # In Streamlit Cloud: BASIC_CODES = ["BASIC-001", "BASIC-TEST"]
+    try:
+        codes = st.secrets.get("BASIC_CODES", [])
+        return set(str(c).strip() for c in codes)
+    except Exception:
+        return set()
 
 
-def create_billing_portal(user_customer_id: str) -> str:
-    portal = stripe.billing_portal.Session.create(
-        customer=user_customer_id,
-        return_url=APP_BASE_URL,
-    )
-    return portal.url
+def get_pro_codes() -> set:
+    # In Streamlit Cloud: PRO_CODES = ["PRO-001", "PRO-TEST"]
+    try:
+        codes = st.secrets.get("PRO_CODES", [])
+        return set(str(c).strip() for c in codes)
+    except Exception:
+        return set()
+
+
+def redeem_basic_ui(user: dict):
+    st.markdown("#### Basic-Tarif aktivieren")
+    code = st.text_input("Basic-Redeem-Code", key="redeem_basic_code")
+    if st.button("Basic-Code einlösen"):
+        codes = get_basic_codes()
+        if not codes:
+            st.error("Keine Basic-Redeem-Codes konfiguriert (BASIC_CODES in Secrets).")
+            return
+        if code.strip() in codes:
+            set_tier(user["id"], TIER_BASIC)
+            st.session_state["user"]["tier"] = TIER_BASIC
+            st.success("Basic-Tarif wurde aktiviert.")
+            st.experimental_rerun()
+        else:
+            st.error("Ungültiger Basic-Code.")
+
+
+def redeem_pro_ui(user: dict):
+    st.markdown("#### Pro-Tarif aktivieren")
+    code = st.text_input("Pro-Redeem-Code", key="redeem_pro_code")
+    if st.button("Pro-Code einlösen"):
+        codes = get_pro_codes()
+        if not codes:
+            st.error("Keine Pro-Redeem-Codes konfiguriert (PRO_CODES in Secrets).")
+            return
+        if code.strip() in codes:
+            set_tier(user["id"], TIER_PRO)
+            st.session_state["user"]["tier"] = TIER_PRO
+            st.success("Pro-Tarif wurde aktiviert.")
+            st.experimental_rerun()
+        else:
+            st.error("Ungültiger Pro-Code.")
 
 
 # ============================
@@ -430,10 +430,9 @@ def login_box():
                 "id": user["id"],
                 "email": user["email"],
                 "tier": user["tier"],
-                "stripe_customer_id": user.get("stripe_customer_id"),
             }
             st.success("Erfolgreich angemeldet.")
-            st.rerun()
+            st.experimental_rerun()
         else:
             st.error(msg)
 
@@ -454,7 +453,7 @@ def register_box():
 def logout_button():
     if st.button("Abmelden"):
         st.session_state["user"] = None
-        st.rerun()
+        st.experimental_rerun()
 
 
 def tier_badge(tier: str) -> str:
@@ -472,7 +471,7 @@ def can_analyze(user: dict) -> Tuple[bool, str, int, int]:
     if used >= limit:
         return (
             False,
-            f"Tageslimit erreicht ({used}/{limit}). Ein Upgrade auf einen höheren Tarif ermöglicht mehr Analysen.",
+            f"Tageslimit erreicht ({used}/{limit}). Ein Upgrade auf Basic oder Pro ermöglicht mehr Analysen.",
             used,
             limit,
         )
@@ -480,8 +479,9 @@ def can_analyze(user: dict) -> Tuple[bool, str, int, int]:
 
 
 # ============================
-# UI
+# INIT & UI
 # ============================
+init_db()
 st.set_page_config(page_title=APP_NAME, layout="centered")
 
 st.title("SourceTD")
@@ -496,27 +496,13 @@ tab_analyze, tab_method, tab_account = st.tabs(["Analyse", "Methodik", "Account"
 with tab_account:
     user = st.session_state.get("user")
 
-    # Query-Parameter (Checkout Rückkehr)
-    params = st.experimental_get_query_params()
-    checkout_status = params.get("checkout", [None])[0]
-
-    if checkout_status in ("success_basic", "success_pro") and user:
-        st.success("Zahlung bei Stripe erfolgreich. Dein Tarif wird aktualisiert.")
-        fresh = get_user_by_email(user["email"])
-        if fresh:
-            st.session_state["user"]["tier"] = fresh["tier"]
-            st.session_state["user"]["stripe_customer_id"] = fresh.get("stripe_customer_id")
-            user = st.session_state["user"]
-    elif checkout_status == "cancel":
-        st.info("Checkout bei Stripe wurde abgebrochen.")
-
     if not user:
         col1, col2 = st.columns(2)
         with col1:
             login_box()
         with col2:
             register_box()
-        st.info("Für die Analyse ist ein Login erforderlich (MVP), damit Free/Basic/Pro-Limits fair umgesetzt werden können.")
+        st.info("Für die Analyse ist ein Login erforderlich, damit Free/Basic/Pro-Limits fair umgesetzt werden können.")
     else:
         st.markdown(f"**Angemeldet:** {user['email']}")
         st.markdown(f"**Tarif:** {tier_badge(user['tier'])}")
@@ -527,56 +513,19 @@ with tab_account:
         logout_button()
 
         st.divider()
-        st.markdown("### Abo / Tarife")
+        st.markdown("### Tarife & Upgrades")
 
         if user["tier"] == TIER_FREE:
-            st.write("Du nutzt aktuell den Free-Tarif. Du kannst auf Basic oder Pro upgraden, um höhere Limits zu erhalten.")
-            col_basic, col_pro = st.columns(2)
-            with col_basic:
-                if st.button("Basic abonnieren", type="secondary"):
-                    checkout_url = create_checkout_session(
-                        price_id=BASIC_PRICE_ID,
-                        user_email=user["email"],
-                        user_id=user["id"],
-                        success_flag="success_basic",
-                    )
-                    st.link_button("Weiter zu Stripe Checkout (Basic)", checkout_url)
-            with col_pro:
-                if st.button("Pro abonnieren", type="primary"):
-                    checkout_url = create_checkout_session(
-                        price_id=PRO_PRICE_ID,
-                        user_email=user["email"],
-                        user_id=user["id"],
-                        success_flag="success_pro",
-                    )
-                    st.link_button("Weiter zu Stripe Checkout (Pro)", checkout_url)
+            st.write("Du nutzt aktuell den Free-Tarif. Du kannst auf Basic oder Pro upgraden (Redeem-Code).")
+            redeem_basic_ui(user)
+            st.divider()
+            redeem_pro_ui(user)
         elif user["tier"] == TIER_BASIC:
             st.success("Du bist aktuell Basic-Nutzer.")
-            col_upgrade, col_portal = st.columns(2)
-            with col_upgrade:
-                if st.button("Auf Pro upgraden", type="primary"):
-                    checkout_url = create_checkout_session(
-                        price_id=PRO_PRICE_ID,
-                        user_email=user["email"],
-                        user_id=user["id"],
-                        success_flag="success_pro",
-                    )
-                    st.link_button("Weiter zu Stripe Checkout (Pro)", checkout_url)
-            with col_portal:
-                if user.get("stripe_customer_id"):
-                    if st.button("Abo verwalten (Billing Portal)"):
-                        portal_url = create_billing_portal(user["stripe_customer_id"])
-                        st.link_button("Zum Stripe Billing Portal", portal_url)
-                else:
-                    st.info("Stripe-Konto ist noch nicht vollständig verknüpft (stripe_customer_id fehlt).")
-        else:  # Pro
+            st.write("Wenn du möchtest, kannst du auf Pro upgraden (Redeem-Code).")
+            redeem_pro_ui(user)
+        else:
             st.success("Du bist aktuell Pro-Nutzer.")
-            if user.get("stripe_customer_id"):
-                if st.button("Abo verwalten (Billing Portal)"):
-                    portal_url = create_billing_portal(user["stripe_customer_id"])
-                    st.link_button("Zum Stripe Billing Portal", portal_url)
-            else:
-                st.info("Stripe-Konto ist noch nicht vollständig verknüpft (stripe_customer_id fehlt).")
 
 # --- Methodik-Tab ---
 with tab_method:
