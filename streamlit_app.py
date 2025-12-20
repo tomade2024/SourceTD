@@ -25,8 +25,8 @@ TIER_PRO = "pro"
 
 # Limits pro Tag je Tarif
 DAILY_LIMITS: Dict[str, int] = {
-    TIER_FREE: 3,        # z. B. 20 Analysen/Tag
-    TIER_BASIC: 20,      # z. B. 100 Analysen/Tag
+    TIER_FREE: 20,        # z. B. 20 Analysen/Tag
+    TIER_BASIC: 100,      # z. B. 100 Analysen/Tag
     TIER_PRO: 10_000,     # quasi unbegrenzt im MVP
 }
 
@@ -75,6 +75,20 @@ def init_db():
             day_key TEXT NOT NULL,
             count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, day_key),
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+    """)
+    # Feedback-Tabelle
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            created_at INTEGER NOT NULL,
+            helpful INTEGER NOT NULL,           -- 1 = ja, 0 = nein
+            comment TEXT,
+            tscore INTEGER,
+            source_url TEXT,
+            source_mode TEXT,                   -- z.B. "URL analysieren" oder "Text einfügen"
             FOREIGN KEY (user_id) REFERENCES users(id)
         );
     """)
@@ -169,6 +183,34 @@ def set_tier(user_id: int, tier: str) -> None:
     conn.execute(
         "UPDATE users SET tier = ? WHERE id = ?",
         (tier, user_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_feedback(
+    user_id: Optional[int],
+    helpful: bool,
+    comment: str,
+    tscore: Optional[int],
+    source_url: Optional[str],
+    source_mode: str,
+) -> None:
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO feedback (user_id, created_at, helpful, comment, tscore, source_url, source_mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            int(time.time()),
+            1 if helpful else 0,
+            comment.strip() if comment else None,
+            int(tscore) if tscore is not None else None,
+            source_url.strip() if source_url else None,
+            source_mode,
+        ),
     )
     conn.commit()
     conn.close()
@@ -559,6 +601,9 @@ with tab_analyze:
     ok, msg, used, limit = can_analyze(user)
     st.markdown(f"**Tarif:** {tier_badge(user['tier'])}  |  **Heute genutzt:** {used}/{limit}")
 
+    # URL vorinitialisieren, damit sie auch im Text-Modus existiert
+    url: str = ""
+
     mode = st.radio("Eingabe", ["URL analysieren", "Text einfügen"], horizontal=True)
 
     article_text: Optional[str] = None
@@ -605,6 +650,45 @@ with tab_analyze:
 
         st.metric("SourceTD-Transparenz-Score", f"{tscore} / 100")
         st.write(short_summary(tscore, mods))
+
+        # ============================
+        # Feedback-Block
+        # ============================
+        st.divider()
+        st.markdown("### Feedback zur Einordnung")
+
+        st.write("War diese Einordnung für dich hilfreich?")
+        col_yes, col_no = st.columns(2)
+
+        helpful_choice = st.radio(
+            "Bitte wähle eine Option:",
+            ("Ja", "Eher nicht"),
+            label_visibility="collapsed",
+            key="feedback_helpful_choice",
+        )
+        comment = st.text_area(
+            "Optionaler Kommentar (z. B. was dir gefehlt hat):",
+            key="feedback_comment",
+            height=80,
+        )
+
+        if st.button("Feedback senden"):
+            source_url = url.strip() if (mode == "URL analysieren" and url) else None
+            source_mode = mode  # "URL analysieren" oder "Text einfügen"
+            helpful_flag = True if helpful_choice == "Ja" else False
+
+            try:
+                save_feedback(
+                    user_id=user["id"],
+                    helpful=helpful_flag,
+                    comment=comment,
+                    tscore=tscore,
+                    source_url=source_url,
+                    source_mode=source_mode,
+                )
+                st.success("Danke für dein Feedback – es hilft, SourceTD weiter zu verbessern.")
+            except Exception as e:
+                st.error(f"Feedback konnte nicht gespeichert werden: {e}")
 
         st.divider()
         st.markdown("## Modulübersicht")
