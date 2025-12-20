@@ -1052,7 +1052,7 @@ with tab_imprint:
     )
     st.markdown("---")
 
-    st.markdown("### Angaben gemäß § 5 TMG (Beispiel)")
+    st.markdown("### Angaben gemäß § 5 TMG")
     st.markdown(
         """
 **Betreiber der Website / Verantwortlich für den Inhalt**
