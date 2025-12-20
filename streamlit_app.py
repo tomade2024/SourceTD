@@ -73,6 +73,9 @@ def debug_db_connection():
 # ============================
 # DATABASE (Supabase Postgres)
 # ============================
+
+
+
 def db_conn():
     """
     Stellt die Verbindung zu Supabase Postgres her.
@@ -84,6 +87,8 @@ def db_conn():
         sep = "&" if "?" in dsn else "?"
         dsn = dsn + f"{sep}sslmode=require"
     return psycopg2.connect(dsn)
+
+
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
