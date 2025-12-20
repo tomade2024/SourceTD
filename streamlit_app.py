@@ -4,7 +4,7 @@ import time
 import hashlib
 import sqlite3
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 
 import requests
 from bs4 import BeautifulSoup
@@ -164,15 +164,15 @@ def get_usage_count(user_id: int, day: str) -> int:
     return int(row[0]) if row else 0
 
 
-def increment_usage(user_id: int, day: str) -> None:
+def increment_usage(user_id: int, day: str, amount: int = 1) -> None:
     conn = db()
     conn.execute(
         """
         INSERT INTO usage_daily (user_id, day_key, count)
-        VALUES (?, ?, 1)
-        ON CONFLICT(user_id, day_key) DO UPDATE SET count = count + 1;
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, day_key) DO UPDATE SET count = count + ?;
         """,
-        (user_id, day),
+        (user_id, day, amount, amount),
     )
     conn.commit()
     conn.close()
@@ -260,6 +260,29 @@ def count_patterns(text: str, patterns) -> int:
     return sum(len(re.findall(p, text, flags=re.IGNORECASE)) for p in patterns)
 
 
+EMOTIONAL_PATTERNS = [
+    r"\bskandal\b", r"\bschock\b", r"\bkatastrophe\b", r"\bundlaublich\b", r"\bdramatisch\b",
+    r"\bempör(ung|t)\b", r"\blüge(n)?\b", r"\bfake\b",
+    r"\bimmer\b", r"\bnie\b", r"\balle\b", r"\bniemand\b"
+]
+
+SOURCE_PATTERNS = [
+    r"https?://\S+",
+    r"\bquelle(n)?\b", r"\bstudie(n)?\b", r"\bericht\b", r"\blaut\b",
+    r"\bnach angaben\b", r"\bzitat\b", r"\berklärte\b", r"\bso heißt es\b"
+]
+
+PERSPECTIVE_PATTERNS = [
+    r"\bjedoch\b", r"\ballerdings\b", r"\bhingegen\b", r"\bandererseits\b", r"\bzugleich\b",
+    r"\bkritiker\b", r"\bbefürworter\b", r"\bgegner\b", r"\bexperten\b"
+]
+
+CONTEXT_PATTERNS = [
+    r"\bseit\b", r"\bim jahr\b", r"\b(19|20)\d{2}\b", r"\bheute\b", r"\bgestern\b", r"\bmorgen\b",
+    r"\bdefinition\b", r"\bhintergrund\b", r"\bkontext\b", r"\beinordnung\b"
+]
+
+
 def analyze_text(text: str) -> Dict[str, ModuleResult]:
     raw = text.strip()
     if len(raw) < 200:
@@ -272,27 +295,12 @@ def analyze_text(text: str) -> Dict[str, ModuleResult]:
         }
 
     url_count = len(re.findall(r"https?://\S+", raw))
-    citation_markers = count_patterns(raw, [
-        r"\bquelle(n)?\b", r"\bstudie(n)?\b", r"\bericht\b", r"\blaut\b",
-        r"\bnach angaben\b", r"\bzitat\b", r"\berklärte\b", r"\bso heißt es\b"
-    ])
+    citation_markers = count_patterns(raw, SOURCE_PATTERNS[1:])
     quote_count = raw.count("„") + raw.count("“") + raw.count('"')
 
-    emotional_markers = count_patterns(raw, [
-        r"\bskandal\b", r"\bschock\b", r"\bkatastrophe\b", r"\bundlaublich\b", r"\bdramatisch\b",
-        r"\bempör(ung|t)\b", r"\blüge(n)?\b", r"\bfake\b",
-        r"\bimmer\b", r"\bnie\b", r"\balle\b", r"\bniemand\b"
-    ])
-
-    perspective_markers = count_patterns(raw, [
-        r"\bjedoch\b", r"\ballerdings\b", r"\bhingegen\b", r"\bandererseits\b", r"\bzugleich\b",
-        r"\bkritiker\b", r"\bbefürworter\b", r"\bgegner\b", r"\bexperten\b"
-    ])
-
-    context_markers = count_patterns(raw, [
-        r"\bseit\b", r"\bim jahr\b", r"\b(19|20)\d{2}\b", r"\bheute\b", r"\bgestern\b", r"\bmorgen\b",
-        r"\bdefinition\b", r"\bhintergrund\b", r"\bkontext\b", r"\beinordnung\b"
-    ])
+    emotional_markers = count_patterns(raw, EMOTIONAL_PATTERNS)
+    perspective_markers = count_patterns(raw, PERSPECTIVE_PATTERNS)
+    context_markers = count_patterns(raw, CONTEXT_PATTERNS)
 
     n_words = len(re.findall(r"\w+", raw))
     length_factor = clamp((n_words - 200) / 1200, 0.0, 1.0)
@@ -364,7 +372,13 @@ def analyze_text(text: str) -> Dict[str, ModuleResult]:
 
 def total_score(mods: Dict[str, ModuleResult]) -> int:
     weights = {"sources": 0.25, "evidence": 0.25, "language": 0.20, "perspectives": 0.15, "context": 0.15}
-    return int(round(sum(mods[k].score * w for k, w in weights.items())))
+    return int(round(sum(mods[k].score * w for w in [0.25, 0.25, 0.20, 0.15, 0.15] for k in ["sources", "evidence", "language", "perspectives", "context"])))
+
+
+# Korrektur: sinnvoller total_score (statt obiger verschachtelter Variante)
+def total_score(mods: Dict[str, ModuleResult]) -> int:
+    weights = {"sources": 0.25, "evidence": 0.25, "language": 0.20, "perspectives": 0.15, "context": 0.15}
+    return int(round(sum(mods[k].score * weights[k] for k in weights)))
 
 
 def short_summary(tscore: int, mods: Dict[str, ModuleResult]) -> str:
@@ -374,6 +388,92 @@ def short_summary(tscore: int, mods: Dict[str, ModuleResult]) -> str:
     if tscore >= 60:
         return "Der Inhalt ist grundsätzlich einordnungsfähig, weist jedoch Schwächen in einzelnen Modulen auf. Prüfe insbesondere die niedriger bewerteten Bereiche."
     return "Der Inhalt ist nur eingeschränkt einordnungsfähig: mehrere Indikatoren deuten auf Lücken bei Belegen, Kontext oder Perspektiven hin."
+
+
+# ============================
+# Zusätzlicher Mehrwert: TL;DR + Verbesserungsvorschläge
+# ============================
+def make_tldr(text: str, tscore: int, mods: Dict[str, ModuleResult]) -> Tuple[str, str]:
+    """Grobe TL;DR-Zusammenfassung + Einordnungs-Kommentar."""
+    raw = re.sub(r"\s+", " ", text.strip())
+    # Sätze grob trennen
+    sentences = re.split(r"([.!?])\s+", raw)
+    combined = []
+    current = ""
+    for part in sentences:
+        current += part
+        if part in [".", "!", "?"]:
+            combined.append(current.strip())
+            current = ""
+        if len(combined) >= 3:
+            break
+    if not combined and raw:
+        tldr = raw[:280] + ("…" if len(raw) > 280 else "")
+    else:
+        tldr = " ".join(combined)
+    comment = short_summary(tscore, mods)
+    return tldr, comment
+
+
+def find_first_snippet(text: str, pattern_list: List[str], window: int = 120) -> Optional[str]:
+    for p in pattern_list:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            start = max(0, m.start() - window // 2)
+            end = min(len(text), m.end() + window // 2)
+            snippet = text[start:end].strip()
+            snippet = re.sub(r"\s+", " ", snippet)
+            return f"…{snippet}…"
+    return None
+
+
+def generate_suggestions(text: str, mods: Dict[str, ModuleResult]) -> List[str]:
+    """Heuristische, konkrete Vorschläge basierend auf Scores & Mustern."""
+    suggestions: List[str] = []
+    raw = text.strip()
+
+    url_count = len(re.findall(r"https?://\S+", raw))
+    citation_markers = count_patterns(raw, SOURCE_PATTERNS[1:])
+    emotional_markers = count_patterns(raw, EMOTIONAL_PATTERNS)
+    perspective_markers = count_patterns(raw, PERSPECTIVE_PATTERNS)
+    context_markers = count_patterns(raw, CONTEXT_PATTERNS)
+
+    # Quellenlage schwach
+    if mods["sources"].score < 55:
+        msg = "An mehreren Stellen werden Aussagen ohne klare Quellenangabe getroffen. Ergänze Links zu Studien, Institutionen oder Primärdokumenten."
+        suggestions.append(msg)
+        if url_count == 0 and citation_markers == 0:
+            suggestions[-1] += " Aktuell konnten kaum Verweiswörter oder Links gefunden werden."
+
+    # Emotionale Sprache
+    if mods["language"].score < 70 and emotional_markers > 0:
+        snippet = find_first_snippet(raw, EMOTIONAL_PATTERNS)
+        base = "Die Sprache wirkt stellenweise stark emotionalisiert (z. B. Wörter wie „Skandal“, „Katastrophe“, „Lüge“). Formuliere an diesen Stellen sachlicher."
+        if snippet:
+            base += f" Beispielstelle: {snippet}"
+        suggestions.append(base)
+
+    # Perspektivenvielfalt
+    if mods["perspectives"].score < 60:
+        suggestions.append(
+            "Es sind nur wenige Hinweise auf alternative Sichtweisen oder Gegenargumente erkennbar. Ergänze z. B. eine Expertenmeinung, eine Gegenposition oder Kritik am beschriebenen Standpunkt."
+        )
+
+    # Kontext
+    if mods["context"].score < 60:
+        suggestions.append(
+            "Der zeitliche oder sachliche Kontext könnte klarer sein. Ergänze z. B. seit wann etwas gilt, wichtige historische Ereignisse oder Definitionen zentraler Begriffe."
+        )
+
+    # Belege
+    if mods["evidence"].score < 60 and citation_markers < 5:
+        suggestions.append(
+            "Mehr nachvollziehbare Belege würden die Einordnung erleichtern. Verweise explizit auf Studien, Berichte oder Datensätze, statt nur allgemein zu behaupten."
+        )
+
+    if not suggestions:
+        suggestions.append("Der Text ist aus Sicht der Heuristik bereits relativ gut strukturiert und eingeordnet. Kleinere Verbesserungen sind je nach Zielgruppe dennoch möglich.")
+    return suggestions
 
 
 # ============================
@@ -454,6 +554,105 @@ def redeem_pro_ui(user: dict):
 
 
 # ============================
+# Admin-Helfer
+# ============================
+def get_admin_emails() -> set:
+    """Admin-E-Mails aus Secrets (ADMIN_EMAILS = ["du@example.com"])."""
+    try:
+        emails = st.secrets.get("ADMIN_EMAILS", [])
+        return set(str(e).lower().strip() for e in emails)
+    except Exception:
+        return set()
+
+
+def is_admin(user: Optional[dict]) -> bool:
+    if not user:
+        return False
+    admins = get_admin_emails()
+    return user["email"].lower() in admins
+
+
+def fetch_feedback_overview(limit: int = 50) -> List[dict]:
+    conn = db()
+    cur = conn.execute(
+        """
+        SELECT f.id,
+               f.created_at,
+               u.email,
+               f.helpful,
+               f.tscore,
+               f.source_url,
+               f.source_mode,
+               f.comment
+        FROM feedback f
+        LEFT JOIN users u ON f.user_id = u.id
+        ORDER BY f.created_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+    for r in rows:
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r[1]))
+        result.append(
+            {
+                "ID": r[0],
+                "Zeit": ts,
+                "User": r[2] or "(unbekannt)",
+                "Hilfreich": "Ja" if r[3] == 1 else "Nein",
+                "Score": r[4],
+                "URL": r[5] or "",
+                "Modus": r[6] or "",
+                "Kommentar": (r[7] or "")[:200],
+            }
+        )
+    return result
+
+
+def fetch_feedback_stats() -> dict:
+    conn = db()
+    cur = conn.execute("SELECT COUNT(*), SUM(helpful), AVG(tscore) FROM feedback")
+    total, sum_helpful, avg_score = cur.fetchone()
+    cur2 = conn.execute(
+        "SELECT source_mode, COUNT(*) FROM feedback GROUP BY source_mode"
+    )
+    by_mode = cur2.fetchall()
+    conn.close()
+
+    total = total or 0
+    sum_helpful = sum_helpful or 0
+    avg_score = avg_score if avg_score is not None else None
+
+    mode_stats = {m or "(unbekannt)": c for (m, c) in by_mode}
+    return {
+        "total": total,
+        "helpful": sum_helpful,
+        "avg_score": avg_score,
+        "by_mode": mode_stats,
+    }
+
+
+def fetch_usage_stats(limit_days: int = 14) -> List[dict]:
+    conn = db()
+    cur = conn.execute(
+        """
+        SELECT day_key, SUM(count)
+        FROM usage_daily
+        GROUP BY day_key
+        ORDER BY day_key DESC
+        LIMIT ?
+        """,
+        (limit_days,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [{"Tag": r[0], "Analysen gesamt": r[1]} for r in rows]
+
+
+# ============================
 # AUTH UI
 # ============================
 def require_login():
@@ -506,14 +705,14 @@ def tier_badge(tier: str) -> str:
     return "Free"
 
 
-def can_analyze(user: dict) -> Tuple[bool, str, int, int]:
+def can_analyze(user: dict, needed: int = 1) -> Tuple[bool, str, int, int]:
     day = day_key_local()
     used = get_usage_count(user["id"], day)
     limit = get_daily_limit(user["tier"])
-    if used >= limit:
+    if used + needed > limit:
         return (
             False,
-            f"Tageslimit erreicht ({used}/{limit}). Ein Upgrade auf Basic oder Pro ermöglicht mehr Analysen.",
+            f"Tageslimit erreicht ({used}/{limit}). Für diese Aktion wären {needed} weitere Analysen nötig.",
             used,
             limit,
         )
@@ -532,7 +731,9 @@ st.caption("Hinweis: SourceTD bewertet keine Wahrheit. Die Analyse dient der Ein
 
 require_login()
 
-tab_analyze, tab_method, tab_account = st.tabs(["Analyse", "Methodik", "Account"])
+tab_analyze, tab_compare, tab_method, tab_account, tab_admin, tab_imprint = st.tabs(
+    ["Analyse", "Vergleich", "Methodik", "Account", "Admin", "Impressum"]
+)
 
 # --- Account-Tab ---
 with tab_account:
@@ -601,9 +802,7 @@ with tab_analyze:
     ok, msg, used, limit = can_analyze(user)
     st.markdown(f"**Tarif:** {tier_badge(user['tier'])}  |  **Heute genutzt:** {used}/{limit}")
 
-    # URL vorinitialisieren, damit sie auch im Text-Modus existiert
     url: str = ""
-
     mode = st.radio("Eingabe", ["URL analysieren", "Text einfügen"], horizontal=True)
 
     article_text: Optional[str] = None
@@ -648,17 +847,25 @@ with tab_analyze:
         mods = analyze_text(article_text)
         tscore = total_score(mods)
 
-        st.metric("SourceTD-Transparenz-Score", f"{tscore} / 100")
-        st.write(short_summary(tscore, mods))
+        # TL;DR + Kommentar
+        tldr, comment = make_tldr(article_text, tscore, mods)
+        st.markdown("### TL;DR")
+        st.write(tldr)
 
-        # ============================
+        st.metric("SourceTD-Transparenz-Score", f"{tscore} / 100")
+        st.write(comment)
+
+        # Konkrete Verbesserungsvorschläge
+        st.divider()
+        st.markdown("### Konkrete Verbesserungsvorschläge")
+        suggestions = generate_suggestions(article_text, mods)
+        for s in suggestions:
+            st.markdown(f"- {s}")
+
         # Feedback-Block
-        # ============================
         st.divider()
         st.markdown("### Feedback zur Einordnung")
-
         st.write("War diese Einordnung für dich hilfreich?")
-        col_yes, col_no = st.columns(2)
 
         helpful_choice = st.radio(
             "Bitte wähle eine Option:",
@@ -666,7 +873,7 @@ with tab_analyze:
             label_visibility="collapsed",
             key="feedback_helpful_choice",
         )
-        comment = st.text_area(
+        comment_fb = st.text_area(
             "Optionaler Kommentar (z. B. was dir gefehlt hat):",
             key="feedback_comment",
             height=80,
@@ -681,7 +888,7 @@ with tab_analyze:
                 save_feedback(
                     user_id=user["id"],
                     helpful=helpful_flag,
-                    comment=comment,
+                    comment=comment_fb,
                     tscore=tscore,
                     source_url=source_url,
                     source_mode=source_mode,
@@ -703,3 +910,188 @@ with tab_analyze:
         module_block("Sprache & Tonalität", "language")
         module_block("Perspektivenvielfalt", "perspectives")
         module_block("Kontext & Vollständigkeit", "context")
+
+
+# --- Vergleichs-Tab ---
+with tab_compare:
+    user = st.session_state.get("user")
+    if not user:
+        st.warning("Bitte zuerst im Tab „Account“ registrieren/anmelden.")
+        st.stop()
+
+    st.markdown("## Vergleich mehrerer Quellen")
+    st.write("Gib bis zu drei Artikel-URLs ein, um Quellenlage, Sprache und Kontext zu vergleichen.")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        url1 = st.text_input("URL 1", key="cmp_url1", placeholder="https://…")
+    with col2:
+        url2 = st.text_input("URL 2", key="cmp_url2", placeholder="https://…")
+    with col3:
+        url3 = st.text_input("URL 3", key="cmp_url3", placeholder="https://…")
+
+    urls = [u.strip() for u in [url1, url2, url3] if u.strip()]
+    needed = len(urls)
+
+    if st.button("Vergleich starten", type="primary", disabled=needed == 0):
+        if needed == 0:
+            st.error("Bitte mindestens eine URL eingeben.")
+        else:
+            ok, msg, used, limit = can_analyze(user, needed=needed)
+            st.markdown(f"**Tarif:** {tier_badge(user['tier'])}  |  **Heute genutzt:** {used}/{limit}")
+            if not ok:
+                st.error(msg)
+            else:
+                increment_usage(user["id"], day_key_local(), amount=needed)
+
+                results = []
+                for u in urls:
+                    key = "url:" + stable_key(u)
+                    cached = cache_get(key)
+                    if cached:
+                        text_u, meta_u = cached["text"], cached["meta"]
+                    else:
+                        try:
+                            with st.spinner(f"Lade und analysiere {u}…"):
+                                text_u, meta_u = fetch_and_extract_text(u)
+                            cache_set(key, {"text": text_u, "meta": meta_u})
+                        except Exception as e:
+                            st.error(f"Fehler bei {u}: {e}")
+                            continue
+
+                    mods_u = analyze_text(text_u)
+                    tscore_u = total_score(mods_u)
+                    results.append((u, meta_u.get("title", ""), tscore_u, mods_u))
+
+                if not results:
+                    st.warning("Es konnten keine gültigen Analysen durchgeführt werden.")
+                else:
+                    st.divider()
+                    st.markdown("### Gesamtvergleich")
+
+                    table_data = []
+                    for (u, title, tscore_u, mods_u) in results:
+                        row = {
+                            "URL": u,
+                            "Titel": title[:80] + ("…" if len(title) > 80 else ""),
+                            "Score gesamt": tscore_u,
+                            "Quellenlage": mods_u["sources"].score,
+                            "Belegstruktur": mods_u["evidence"].score,
+                            "Sprache": mods_u["language"].score,
+                            "Perspektiven": mods_u["perspectives"].score,
+                            "Kontext": mods_u["context"].score,
+                        }
+                        table_data.append(row)
+                    st.dataframe(table_data)
+
+                    st.markdown("### Einordnung")
+                    best = max(results, key=lambda r: r[2])
+                    best_url, best_title, best_score, best_mods = best
+                    st.write(
+                        f"Unter den eingegebenen Quellen wirkt die Seite mit der URL "
+                        f"`{best_url}` insgesamt am einordnungsfähigsten (Score {best_score}/100). "
+                        f"Prüfe dennoch im Detail, ob Quellen, Kontext und Sprache zu deinem Bedarf passen."
+                    )
+
+
+# --- Admin-Tab ---
+with tab_admin:
+    user = st.session_state.get("user")
+    if not user:
+        st.warning("Bitte zuerst im Tab „Account“ anmelden.")
+        st.stop()
+
+    if not is_admin(user):
+        st.error("Kein Admin-Zugriff. Hinterlege deine E-Mail-Adresse in den ADMIN_EMAILS-Secrets, um den Admin-Bereich zu nutzen.")
+        st.info("Beispiel in Streamlit Secrets:\n\nADMIN_EMAILS = [\"deine.mail@example.com\"]")
+        st.stop()
+
+    st.markdown("## Admin-Bereich")
+    st.caption("Nur sichtbar für Admin-E-Mails (ADMIN_EMAILS in Secrets).")
+
+    # Feedback-Statistiken
+    st.subheader("Feedback-Statistiken")
+    stats = fetch_feedback_stats()
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Feedback gesamt", stats["total"])
+    with col_b:
+        helpful_rate = (stats["helpful"] / stats["total"] * 100) if stats["total"] > 0 else 0
+        st.metric("Hilfreich-Anteil", f"{helpful_rate:.1f} %")
+    with col_c:
+        avg_sc = stats["avg_score"] if stats["avg_score"] is not None else 0
+        st.metric("Ø Score (Feedback)", f"{avg_sc:.1f}")
+
+    st.markdown("**Feedback nach Modus**")
+    st.write(stats["by_mode"])
+
+    st.divider()
+    st.subheader("Letzte Feedback-Einträge")
+    fb_rows = fetch_feedback_overview(limit=50)
+    if fb_rows:
+        st.dataframe(fb_rows)
+    else:
+        st.info("Noch keine Feedback-Einträge vorhanden.")
+
+    st.divider()
+    st.subheader("Nutzung nach Tagen (global)")
+    usage_rows = fetch_usage_stats(limit_days=14)
+    if usage_rows:
+        st.dataframe(usage_rows)
+    else:
+        st.info("Noch keine Nutzungsdaten vorhanden.")
+
+
+# --- Impressum-Tab ---
+with tab_imprint:
+    st.markdown("## Impressum")
+    st.write(
+        "Hinweis: Die folgenden Angaben sind ein Platzhalter. "
+        "Bitte ersetze sie durch deine tatsächlichen Impressumsdaten entsprechend der rechtlichen Anforderungen "
+        "(z. B. nach § 5 TMG in Deutschland)."
+    )
+    st.markdown("---")
+
+    st.markdown("### Angaben gemäß § 5 TMG (Beispiel)")
+    st.markdown(
+        """
+**Betreiber der Website / Verantwortlich für den Inhalt**
+
+Tobias Demmler  
+Klosterstraße 8  
+13581 Berlin 
+Deutschlandd  
+
+Telefon: +49 (0)1702109497  
+E-Mail: Tobias.demmler@outlook.de  
+
+---
+
+### Verantwortlich für den Inhalt nach § 55 Abs. 2 RStV
+
+Tobias Demmler  
+Klosterstraße 8  
+13581 Berlin 
+Deutschland  
+
+---
+
+### Haftungsausschluss
+
+**Haftung für Inhalte**  
+Die Inhalte dieser Anwendung wurden mit größter Sorgfalt erstellt. Für die Richtigkeit, Vollständigkeit und Aktualität der Inhalte kann jedoch keine Gewähr übernommen werden.  
+SourceTD bewertet keine Wahrheit, sondern analysiert Inhalte anhand heuristischer Transparenz-Indikatoren.
+
+**Haftung für Links**  
+Diese Anwendung kann Links zu externen Websites enthalten, auf deren Inhalte kein Einfluss besteht. Für diese fremden Inhalte wird keine Gewähr übernommen; verantwortlich ist jeweils der Anbieter oder Betreiber der verlinkten Seiten.
+
+---
+
+### Urheberrecht
+
+Die durch den Betreiber erstellten Inhalte und Werke in dieser Anwendung unterliegen dem deutschen Urheberrecht. Beiträge Dritter sind als solche gekennzeichnet.  
+Die Vervielfältigung, Bearbeitung, Verbreitung und jede Art der Verwertung außerhalb der Grenzen des Urheberrechtes bedürfen der schriftlichen Zustimmung des jeweiligen Autors bzw. Erstellers.
+
+"""
+    )
+    st.info("Bitte passe Namen, Adresse und Kontaktdaten im Impressum an deine tatsächlichen Angaben an.")
