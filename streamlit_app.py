@@ -389,7 +389,7 @@ def redeem_basic_ui(user: dict):
             set_tier(user["id"], TIER_BASIC)
             st.session_state["user"]["tier"] = TIER_BASIC
             st.success("Basic-Tarif wurde aktiviert.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Ungültiger Basic-Code.")
 
@@ -406,7 +406,7 @@ def redeem_pro_ui(user: dict):
             set_tier(user["id"], TIER_PRO)
             st.session_state["user"]["tier"] = TIER_PRO
             st.success("Pro-Tarif wurde aktiviert.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Ungültiger Pro-Code.")
 
@@ -432,7 +432,7 @@ def login_box():
                 "tier": user["tier"],
             }
             st.success("Erfolgreich angemeldet.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error(msg)
 
@@ -453,7 +453,7 @@ def register_box():
 def logout_button():
     if st.button("Abmelden"):
         st.session_state["user"] = None
-        st.experimental_rerun()
+        st.rerun()
 
 
 def tier_badge(tier: str) -> str:
